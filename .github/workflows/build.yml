@@ -1,0 +1,146 @@
+name: Build Evolution X for Redmi Note 13 5G (gold/iron)
+
+on:
+  workflow_dispatch:
+    inputs:
+      evo_branch:
+        description: 'Evolution X Branch'
+        required: true
+        default: 'vic'
+        type: choice
+        options:
+          - 'vic'
+          - 'udc'
+      build_variant:
+        description: 'Build Variant'
+        required: true
+        default: 'userdebug'
+        type: choice
+        options:
+          - 'userdebug'
+          - 'user'
+          - 'eng'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Maximize Disk Space & Setup Swap
+        run: |
+          echo "==> Reclaiming disk space..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
+          sudo docker system prune -a -f --volumes || true
+          
+          echo "==> Configuring 16GB Virtual Swap..."
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo fallocate -l 16G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=16384
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+          df -h
+          free -h
+
+      - name: Setup Android Build Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-core gnupg flex bison build-essential zip curl zlib1g-dev \
+          libc6-dev-i386 libncurses5 x11proto-core-dev libx11-dev lib32z1-dev libgl1-mesa-dev \
+          libxml2-utils xsltproc unzip fontconfig python3 python-is-python3 rsync bc libssl-dev ccache git-lfs
+
+          mkdir -p ~/bin
+          curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          sudo ln -sf ~/bin/repo /usr/bin/repo
+
+      - name: Initialize Evolution X Source & Gold Tree
+        run: |
+          mkdir -p ~/rom && cd ~/rom
+          git config --global user.name "RizalNurfajri"
+          git config --global user.email "rizalnurfajri@users.noreply.github.com"
+          git config --global color.ui false
+
+          echo "==> Initializing Evolution X Manifest (${{ inputs.evo_branch }})"
+          repo init -u https://github.com/Evolution-X/manifest -b ${{ inputs.evo_branch }} --git-lfs --depth=1
+
+          echo "==> Setting up local manifest for Redmi Note 13 5G (gold/iron)"
+          mkdir -p .repo/local_manifests
+          cat << 'EOF' > .repo/local_manifests/gold.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <remote name="gold_src" fetch="https://github.com/Star-caorui" />
+            <project name="android_device_xiaomi_gold" path="device/xiaomi/gold" remote="gold_src" revision="lineage-23.2" />
+            <project name="android_device_xiaomi_gold-kernels" path="device/xiaomi/gold-kernel" remote="gold_src" revision="lineage-23.2" clone-depth="1" />
+            <project name="android_vendor_xiaomi_gold" path="vendor/xiaomi/gold" remote="gold_src" revision="lineage-23.2" clone-depth="1" />
+            <project name="LineageOS/android_device_mediatek_sepolicy_vndr" path="device/mediatek/sepolicy_vndr" />
+            <project name="LineageOS/android_hardware_mediatek" path="hardware/mediatek" />
+            <project name="LineageOS/android_hardware_xiaomi" path="hardware/xiaomi" />
+          </manifest>
+          EOF
+
+          echo "==> Syncing ROM Source & Device Trees"
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+          echo "==> Freeing metadata space"
+          rm -rf .repo
+          df -h
+
+      - name: Configure Evolution X Target
+        run: |
+          cd ~/rom/device/xiaomi/gold
+          
+          # Evolution X inherits from Lineage tree structure
+          cat << 'EOF' > evolution_gold.mk
+          # Inherit Evolution X configs
+          $(call inherit-product, vendor/evolution/config/common_full_phone.mk)
+
+          # Inherit from device makefile
+          $(call inherit-product, device/xiaomi/gold/device.mk)
+
+          PRODUCT_NAME := evolution_gold
+          PRODUCT_DEVICE := gold
+          PRODUCT_MANUFACTURER := Xiaomi
+          PRODUCT_BRAND := Redmi
+          PRODUCT_MODEL := 2312DRAABC
+
+          TARGET_SUPPORTS_QUICK_TAP := true
+          EVO_BUILD_TYPE := UNOFFICIAL
+          EOF
+
+          cat << 'EOF' >> AndroidProducts.mk
+          PRODUCT_MAKEFILES += $(LOCAL_DIR)/evolution_gold.mk
+          COMMON_LUNCH_CHOICES += evolution_gold-${{ inputs.build_variant }}
+          EOF
+
+      - name: Compile Evolution X ROM
+        run: |
+          cd ~/rom
+          export USE_CCACHE=1
+          export CCACHE_EXEC=$(which ccache)
+          export CCACHE_DIR=~/ccache
+          ccache -M 20G
+
+          source build/envsetup.sh
+          lunch evolution_gold-${{ inputs.build_variant }}
+          
+          echo "==> Compiling ROM ZIP..."
+          m evolution -j$(nproc --all) || m bacon -j$(nproc --all)
+
+      - name: Upload Output ZIP
+        if: success()
+        run: |
+          cd ~/rom/out/target/product/gold/
+          OUTPUT_ZIP=$(ls evolution_gold*.zip EvolutionX*.zip 2>/dev/null | head -n 1)
+          if [ -n "$OUTPUT_ZIP" ]; then
+            echo "Uploading $OUTPUT_ZIP..."
+            curl -F "file=@$OUTPUT_ZIP" https://bashupload.com
+          else
+            echo "No output zip found."
+            ls -la
+          fi
